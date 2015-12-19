@@ -158,6 +158,7 @@ static int usage(void)
     DISPLAY( " -d     : decompression (default for %s extension)\n", LZ4_EXTENSION);
     DISPLAY( " -z     : force compression\n");
     DISPLAY( " -f     : overwrite output without prompting \n");
+    DISPLAY( " -P#    : multi core compression using #cores\n");
     DISPLAY( " -h/-H  : display help/long help and exit\n");
     return 0;
 }
@@ -281,6 +282,7 @@ int main(int argc, char** argv)
     char nullOutput[] = NULL_OUTPUT;
     char extension[] = LZ4_EXTENSION;
     int  blockSize;
+    int coreCount = -1;
 
     /* Init */
     programName = argv[0];
@@ -415,6 +417,10 @@ int main(int argc, char** argv)
                     }
                     break;
 
+                case 'P':
+                    sscanf(argument + 1, "%d", &coreCount);
+                    break;
+
                     /* Benchmark */
                 case 'b': bench=1; multiple_inputs=1;
                     if (inFileNames == NULL)
@@ -503,7 +509,7 @@ int main(int argc, char** argv)
         {
             size_t l = strlen(input_filename);
             dynNameSpace = (char*)calloc(1,l+5);
-			if (dynNameSpace==NULL) exit(1);
+            if (dynNameSpace==NULL) exit(1);
             strcpy(dynNameSpace, input_filename);
             strcat(dynNameSpace, LZ4_EXTENSION);
             output_filename = dynNameSpace;
@@ -555,7 +561,10 @@ int main(int argc, char** argv)
         if (multiple_inputs)
           operationResult = LZ4IO_compressMultipleFilenames(inFileNames, ifnIdx, LZ4_EXTENSION, cLevel);
         else
-          DEFAULT_COMPRESSOR(input_filename, output_filename, cLevel);
+          if (coreCount > 0)
+              LZ4IO_compressFilenameParallel(input_filename, output_filename, cLevel, coreCount);
+          else
+              DEFAULT_COMPRESSOR(input_filename, output_filename, cLevel);
       }
     }
 

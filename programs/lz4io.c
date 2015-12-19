@@ -52,6 +52,7 @@
 #include <time.h>      /* clock */
 #include <sys/types.h> /* stat64 */
 #include <sys/stat.h>  /* stat64 */
+#include <assert.h>
 #include "lz4io.h"
 #include "lz4.h"       /* still required for legacy format */
 #include "lz4hc.h"     /* still required for legacy format */
@@ -134,7 +135,7 @@ static clock_t g_time = 0;
 static int g_overwrite = 1;
 static int g_blockSizeId = LZ4IO_BLOCKSIZEID_DEFAULT;
 static int g_blockChecksum = 0;
-static int g_streamChecksum = 1;
+static int g_streamChecksum = 0;
 static int g_blockIndependence = 1;
 static int g_sparseFileSupport = 1;
 static int g_contentSizeFlag = 0;
@@ -564,6 +565,134 @@ static int LZ4IO_compressFilename_extRess(cRess_t ress, const char* srcFileName,
     return 0;
 }
 
+typedef struct {
+    cRess_t res;
+    unsigned long long blockCount; // in bytes
+    unsigned long long startPosition; // in bytes
+    unsigned long long compressSize;
+    char* inFileName;
+    char* outTempFileName;
+    LZ4F_preferences_t prefs;
+} ThreadInfo;
+
+int LZ4IO_compressFilenameParallel(const char* srcFileName, const char* dstFileName, int compressionLevel, int _noCores)
+{
+    const size_t blockSize = (size_t)LZ4IO_GetBlockSize_FromBlockId (g_blockSizeId);
+    LZ4F_preferences_t prefs;
+
+    assert(_noCores > 0);
+    unsigned noCores = (unsigned)_noCores;
+
+    /* Init */
+    memset(&prefs, 0, sizeof(prefs));
+
+    /* File check */
+    //if (LZ4IO_getFiles(srcFileName, dstFileName, &srcFile, &dstFile)) return 1;
+    unsigned long long fileSize = LZ4IO_GetFileSize(srcFileName);
+
+    /* Set compression parameters */
+    prefs.autoFlush = 1;
+    prefs.compressionLevel = compressionLevel;
+    prefs.frameInfo.blockMode = (LZ4F_blockMode_t)g_blockIndependence;
+    prefs.frameInfo.blockSizeID = (LZ4F_blockSizeID_t)g_blockSizeId;
+    prefs.frameInfo.contentChecksumFlag = (LZ4F_contentChecksum_t)g_streamChecksum;
+    if (g_contentSizeFlag)
+    {
+      prefs.frameInfo.contentSize = fileSize;   /* == 0 if input == stdin */
+      if (fileSize==0)
+          DISPLAYLEVEL(3, "Warning : cannot determine uncompressed frame content size \n");
+    }
+
+    unsigned long long totalBlocks = fileSize / blockSize;
+
+    // If there are not enough blocks, we'll only have on block per thread
+    if (noCores > totalBlocks)
+        noCores = totalBlocks;
+    ThreadInfo* infos = calloc(noCores, sizeof(*infos));
+    assert(infos);
+
+    for (unsigned i = 0; i < noCores; ++i) {
+        infos[i].res = LZ4IO_createCResources();
+        infos[i].blockCount = totalBlocks / noCores;
+        infos[i].startPosition = i ? infos[i - 1].startPosition + infos[i - 1].blockCount * blockSize : 0;
+        size_t outTempFileNameSize = 5 + strlen(dstFileName);
+        infos[i].outTempFileName = malloc(outTempFileNameSize);
+        snprintf(infos[i].outTempFileName, outTempFileNameSize, "%s%d", dstFileName, i);
+        infos[i].inFileName = malloc(strlen(srcFileName));
+        strcpy(infos[i].inFileName, srcFileName);
+        memcpy(&(infos[i].prefs), &prefs, sizeof(prefs));
+    }
+    infos[noCores - 1].blockCount += (totalBlocks % noCores) + ((fileSize % blockSize) > 0);
+
+    // simulate threads here
+    for (unsigned i = 0; i < noCores; ++i) {
+        ThreadInfo* info = &infos[i];
+        if (!info->blockCount)
+            continue;
+
+        FILE* outFile = fopen(info->outTempFileName, "wb");
+        assert(outFile);
+        FILE* inFile = fopen(info->inFileName, "rb");
+        assert(inFile);
+        assert(fseek(inFile, info->startPosition, SEEK_SET) == 0);
+        //compressBegin only for perfs init, we don't write any header here
+        assert(!LZ4F_isError(LZ4F_compressBegin(info->res.ctx, info->res.dstBuffer,
+                        info->res.dstBufferSize, &info->prefs)));
+
+        for (unsigned long long bi = 0; bi < info->blockCount; ++bi) {
+            size_t readSize = fread(info->res.srcBuffer, 1, blockSize, inFile);
+            assert(readSize);
+            size_t outSize = LZ4F_compressUpdate(info->res.ctx, info->res.dstBuffer, info->res.dstBufferSize,
+                info->res.srcBuffer, readSize, NULL);
+            assert(!LZ4F_isError(outSize));
+            assert(fwrite(info->res.dstBuffer, 1, outSize, outFile) == outSize);
+            info->compressSize += outSize;
+        }
+
+        fclose(inFile);
+        fclose(outFile);
+    }
+
+    FILE* dstFile = fopen(dstFileName, "wb");
+    // write the actual header
+    cRess_t hres = LZ4IO_createCResources();
+    size_t headerSize = LZ4F_compressBegin(hres.ctx, hres.dstBuffer, hres.dstBufferSize, &prefs);
+    assert(!LZ4F_isError(headerSize));
+    assert(fwrite(hres.dstBuffer, 1, headerSize, dstFile) == headerSize);
+    const unsigned long long COPY_BLOCK_SIZE = 8 * 1024 *1024;
+    char* buff = malloc(COPY_BLOCK_SIZE);
+    unsigned long long totalSize = headerSize;
+
+    assert(buff);
+    for (unsigned i = 0; i < noCores; ++i) {
+        size_t rSize;
+        FILE* inTmpFile = fopen(infos[i].outTempFileName, "rb");
+        assert(inTmpFile);
+        while ((rSize = fread(buff, 1, COPY_BLOCK_SIZE, inTmpFile)) > 0) {
+            assert(fwrite(buff, 1, rSize, dstFile) == rSize);
+        }
+        totalSize += infos[i].compressSize;
+        fclose(inTmpFile);
+    }
+
+    // flush the last incomplete block
+
+    headerSize = LZ4F_compressEnd(infos[noCores - 1].res.ctx, infos[noCores - 1].res.dstBuffer,
+            infos[noCores - 1].res.dstBufferSize, NULL);
+    assert(!LZ4F_isError(headerSize));
+    totalSize += headerSize;
+    assert(headerSize == fwrite(infos[noCores - 1].res.dstBuffer, 1, headerSize, dstFile));
+
+    /* Release files */
+    fclose (dstFile);
+
+    /* Final Status */
+    DISPLAYLEVEL(2, "\r%79s\r", "");
+    DISPLAYLEVEL(2, "Compressed %llu bytes into %llu bytes ==> %.2f%%\n",
+        fileSize, totalSize, (double)totalSize/fileSize*100);   /* avoid division by zero */
+
+    return 0;
+}
 
 int LZ4IO_compressFilename(const char* srcFileName, const char* dstFileName, int compressionLevel)
 {

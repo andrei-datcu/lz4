@@ -48,6 +48,7 @@ static char const nulmark[] = "/dev/null";
 /* ****************** Functions ********************* */
 /* ************************************************** */
 
+int LZ4IO_compressFilenameParallel(const char* srcFileName, const char* dstFileName, int compressionLevel, int noCores);
 int LZ4IO_compressFilename  (const char* input_filename, const char* output_filename, int compressionlevel);
 int LZ4IO_decompressFilename(const char* input_filename, const char* output_filename);
 
