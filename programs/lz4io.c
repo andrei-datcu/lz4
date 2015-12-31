@@ -57,6 +57,7 @@
 #include "lz4.h"       /* still required for legacy format */
 #include "lz4hc.h"     /* still required for legacy format */
 #include "lz4frame.h"
+#include "writer_manager.h"
 
 
 /******************************
@@ -565,30 +566,16 @@ static int LZ4IO_compressFilename_extRess(cRess_t ress, const char* srcFileName,
     return 0;
 }
 
-typedef struct {
-    cRess_t res;
-    unsigned long long blockCount; // in bytes
-    unsigned long long startPosition; // in bytes
-    unsigned long long compressSize;
-    char* inFileName;
-    char* outTempFileName;
-    LZ4F_preferences_t prefs;
-} ThreadInfo;
-
-int LZ4IO_compressFilenameParallel(const char* srcFileName, const char* dstFileName, int compressionLevel, int _noCores)
+int LZ4IO_compressFilenameParallel(const char* srcFileName, const char* dstFileName, int compressionLevel, int noCores, int rank)
 {
     const size_t blockSize = (size_t)LZ4IO_GetBlockSize_FromBlockId (g_blockSizeId);
+    const int CHUNK_SIZE = 8 * 1024 * 1024; // 4 MEGA -- singed int because of MPI
     LZ4F_preferences_t prefs;
 
-    assert(_noCores > 0);
-    unsigned noCores = (unsigned)_noCores;
+    assert(noCores > 0);
 
     /* Init */
     memset(&prefs, 0, sizeof(prefs));
-
-    /* File check */
-    //if (LZ4IO_getFiles(srcFileName, dstFileName, &srcFile, &dstFile)) return 1;
-    unsigned long long fileSize = LZ4IO_GetFileSize(srcFileName);
 
     /* Set compression parameters */
     prefs.autoFlush = 1;
@@ -596,101 +583,143 @@ int LZ4IO_compressFilenameParallel(const char* srcFileName, const char* dstFileN
     prefs.frameInfo.blockMode = (LZ4F_blockMode_t)g_blockIndependence;
     prefs.frameInfo.blockSizeID = (LZ4F_blockSizeID_t)g_blockSizeId;
     prefs.frameInfo.contentChecksumFlag = (LZ4F_contentChecksum_t)g_streamChecksum;
-    if (g_contentSizeFlag)
-    {
-      prefs.frameInfo.contentSize = fileSize;   /* == 0 if input == stdin */
-      if (fileSize==0)
-          DISPLAYLEVEL(3, "Warning : cannot determine uncompressed frame content size \n");
-    }
+    const int COMPRESS_SIZE = LZ4F_compressBound(CHUNK_SIZE, &prefs);
 
-    unsigned long long totalBlocks = fileSize / blockSize;
+    cRess_t res = LZ4IO_createCResources();
+    unsigned long long fileSize = LZ4IO_GetFileSize(srcFileName);
 
-    // If there are not enough blocks, we'll only have on block per thread
-    if (noCores > totalBlocks)
-        noCores = totalBlocks;
-    ThreadInfo* infos = calloc(noCores, sizeof(*infos));
-    assert(infos);
+    if (rank == 0) {
+        // write the actual header
+        write_scheduler_init(dstFileName, 3 * noCores, COMPRESS_SIZE);
+        void *header_location = write_scheduler_get_next_available_memory();
+        size_t headerSize = LZ4F_compressBegin(res.ctx, header_location, res.dstBufferSize, &prefs);
+        assert(!LZ4F_isError(headerSize));
+        write_scheduler_write(0, header_location, headerSize);
 
-    for (unsigned i = 0; i < noCores; ++i) {
-        infos[i].res = LZ4IO_createCResources();
-        infos[i].blockCount = totalBlocks / noCores;
-        infos[i].startPosition = i ? infos[i - 1].startPosition + infos[i - 1].blockCount * blockSize : 0;
-        size_t outTempFileNameSize = 5 + strlen(dstFileName);
-        infos[i].outTempFileName = malloc(outTempFileNameSize);
-        snprintf(infos[i].outTempFileName, outTempFileNameSize, "%s%d", dstFileName, i);
-        infos[i].inFileName = malloc(strlen(srcFileName));
-        strcpy(infos[i].inFileName, srcFileName);
-        memcpy(&(infos[i].prefs), &prefs, sizeof(prefs));
-    }
-    infos[noCores - 1].blockCount += (totalBlocks % noCores) + ((fileSize % blockSize) > 0);
-
-    // simulate threads here
-    for (unsigned i = 0; i < noCores; ++i) {
-        ThreadInfo* info = &infos[i];
-        if (!info->blockCount)
-            continue;
-
-        FILE* outFile = fopen(info->outTempFileName, "wb");
-        assert(outFile);
-        FILE* inFile = fopen(info->inFileName, "rb");
+        MPI_Request recv_requests[noCores];
+        MPI_Status  status;
+        for (int i = 0; i < noCores; ++i)
+            recv_requests[i] = MPI_REQUEST_NULL;
+        FILE* inFile = fopen(srcFileName, "rb");
         assert(inFile);
-        assert(fseek(inFile, info->startPosition, SEEK_SET) == 0);
-        //compressBegin only for perfs init, we don't write any header here
-        assert(!LZ4F_isError(LZ4F_compressBegin(info->res.ctx, info->res.dstBuffer,
-                        info->res.dstBufferSize, &info->prefs)));
+        char *sendbuff = malloc (CHUNK_SIZE * noCores);
+        assert(sendbuff);
 
-        for (unsigned long long bi = 0; bi < info->blockCount; ++bi) {
-            size_t readSize = fread(info->res.srcBuffer, 1, blockSize, inFile);
-            assert(readSize);
-            size_t outSize = LZ4F_compressUpdate(info->res.ctx, info->res.dstBuffer, info->res.dstBufferSize,
-                info->res.srcBuffer, readSize, NULL);
-            assert(!LZ4F_isError(outSize));
-            assert(fwrite(info->res.dstBuffer, 1, outSize, outFile) == outSize);
-            info->compressSize += outSize;
+        typedef struct {
+            unsigned long long index;
+            char* data;
+        } node_info_t;
+        node_info_t node_infos[noCores];
+        memset(node_infos, 0, sizeof(node_infos));
+        int anythingSent = 0;
+
+        for (unsigned long long index = 1;;++index) {
+            int first_free_node;
+            MPI_Waitany(noCores, recv_requests, &first_free_node, &status);
+            if (anythingSent) {
+                int count;
+                MPI_get_count(&status, MPI_CHAR, &count);
+                assert(node_infos[first_free_node].index > 0);
+                if (write_scheduler_write(node_infos[first_free_node].index,
+                            node_infos[first_free_node].data, count) != 0) {
+                    // No more room
+                    // Determine the lowest one
+                    int min_node = 0;
+                    for (int i = 1; i < noCores; ++i)
+                        if (node_infos[i].index < node_infos[min_node].index)
+                            min_node = i;
+                    assert(min_node != first_free_node);
+                    MPI_Wait(&recv_requests[min_node], &status);
+                  int another_count;
+                    MPI_get_count(&status, MPI_CHAR, &another_count);
+                    assert(write_scheduler_write(node_infos[min_node].index,
+                                node_infos[min_node].data, another_count) == 0);
+                    node_infos[min_node].index = 0;
+                    assert(write_scheduler_write(node_infos[first_free_node].index,
+                            node_infos[first_free_node].data, count) == 0);
+                }
+                node_infos[first_free_node].index = 0;
+            }
+
+            void* send_start_pointer = sendbuff + first_free_node * CHUNK_SIZE;
+            //FIXME this does not solve last chunk's issue. What if we have 32M+1byte??!!
+            size_t bytesRead = fread(send_start_pointer, 1, CHUNK_SIZE, inFile);
+            if (bytesRead == 0)
+                break;
+
+            node_infos[first_free_node].index = index;
+            node_infos[first_free_node].data = write_scheduler_get_next_available_memory();
+
+            if (node_infos[first_free_node.data] == NULL) {
+                // No more room
+                // Determine the lowest one
+                int min_node = 0;
+                for (int i = 1; i < noCores; ++i)
+                    if (node_infos[i].index < node_infos[min_node].index)
+                        min_node = i;
+                assert(min_node != first_free_node);
+                MPI_Wait(&recv_requests[min_node], &status);
+                int another_count;
+                MPI_get_count(&status, MPI_CHAR, &another_count);
+                assert(write_scheduler_write(node_infos[min_node].index,
+                            node_infos[min_node].data, another_count) == 0);
+                node_infos[first_free_node].data = write_scheduler_get_next_available_memory();
+                assert(node_infos[first_free_node].data);
+                node_infos[min_node].index = 0;
+            }
+
+            MPI_Request send_request;
+            MPI_Isend(send_start_pointer, bytesRead, MPI_CHAR, first_free_node,
+                    1, MPI_COMM_WORLD, &send_request);
+            MPI_Irecv(node_infos[first_free_node].data, COMPRESS_SIZE, MPI_CHAR,
+                    first_free_node, 1, MPI_COMM_WORLD, recv_requests + first_free_node);
         }
 
+        MPI_Status final_statuses[noCores];
+        MPI_Waitall(noCores, recv_requests, final_statuses);
+        for (int node = 0; node < noCores; ++node) {
+            if (node_infos[node].index != 0)
+                int count;
+                MPI_get_count(&final_statuses[node], MPI_CHAR, &count);
+                assert(write_scheduler_write(node_infos[node].index,
+                            node_infos[node].data, count) == 0);
+        }
+
+        write_scheduler_close();
+        free(sendbuff);
         fclose(inFile);
-        fclose(outFile);
-    }
 
-    FILE* dstFile = fopen(dstFileName, "wb");
-    // write the actual header
-    cRess_t hres = LZ4IO_createCResources();
-    size_t headerSize = LZ4F_compressBegin(hres.ctx, hres.dstBuffer, hres.dstBufferSize, &prefs);
-    assert(!LZ4F_isError(headerSize));
-    assert(fwrite(hres.dstBuffer, 1, headerSize, dstFile) == headerSize);
-    const unsigned long long COPY_BLOCK_SIZE = 8 * 1024 *1024;
-    char* buff = malloc(COPY_BLOCK_SIZE);
-    unsigned long long totalSize = headerSize;
-
-    assert(buff);
-    for (unsigned i = 0; i < noCores; ++i) {
-        size_t rSize;
-        FILE* inTmpFile = fopen(infos[i].outTempFileName, "rb");
-        assert(inTmpFile);
-        while ((rSize = fread(buff, 1, COPY_BLOCK_SIZE, inTmpFile)) > 0) {
-            assert(fwrite(buff, 1, rSize, dstFile) == rSize);
+        char finish_msg[2] = {0xDE, 0xAD};
+        for (int node = 0; node < noCores; ++node) {
+            MPI_Send(finish_msg, 2, MPI_CHAR, node, 2, MPI_COMM_WORLD);
         }
-        totalSize += infos[i].compressSize;
-        fclose(inTmpFile);
+    } else {
+        //compressBegin only for perfs init, we don't write any header here
+        assert(!LZ4F_isError(LZ4F_compressBegin(res.ctx, res.dstBuffer,
+                        res.dstBufferSize, prefs)));
+
+        char* recvbuff = malloc(CHUNK_SIZE);
+        char* comprbuff = malloc(COMPRESS_SIZE);
+        MPI_Status status;
+        for (;;) {
+            MPI_Recv(recvbuff, CHUNK_SIZE, MPI_CHAR, 0, MPI_ANY_TAG, MPI_COMM_WORLD, &status);
+            int count;
+            MPI_get_count(&final_statuses[node], MPI_CHAR, &count);
+            if (status.MPI_TAG == 2) {
+                assert(count == 2);
+                assert(recvbuff[0] == '\xDE' && recvbuff[1] == '\xAD');
+                break;
+            }
+            assert(status.MPI_TAG == 1);
+            size_t outSize = LZ4F_compressUpdate(res.ctx, comprbuff, COMPRESS_SIZE,
+                    recvbuff, count, NULL);
+            assert(!LZ4F_isError(outSize));
+            MPI_Send(comprbuff, outSize, MPI_CHAR, 0, 1, MPI_COMM_WORLD);
+        }
+        free(recvbuff);
+        free(comprbuff);
     }
-
-    // flush the last incomplete block
-
-    headerSize = LZ4F_compressEnd(infos[noCores - 1].res.ctx, infos[noCores - 1].res.dstBuffer,
-            infos[noCores - 1].res.dstBufferSize, NULL);
-    assert(!LZ4F_isError(headerSize));
-    totalSize += headerSize;
-    assert(headerSize == fwrite(infos[noCores - 1].res.dstBuffer, 1, headerSize, dstFile));
-
-    /* Release files */
-    fclose (dstFile);
-
-    /* Final Status */
-    DISPLAYLEVEL(2, "\r%79s\r", "");
-    DISPLAYLEVEL(2, "Compressed %llu bytes into %llu bytes ==> %.2f%%\n",
-        fileSize, totalSize, (double)totalSize/fileSize*100);   /* avoid division by zero */
-
+    LZ4IO_freeCResources(res);
     return 0;
 }
 

@@ -60,6 +60,7 @@
 #include <string.h>   /* strcmp, strlen */
 #include "bench.h"    /* BMK_benchFile, BMK_SetNbIterations, BMK_SetBlocksize, BMK_SetPause */
 #include "lz4io.h"    /* LZ4IO_compressFilename, LZ4IO_decompressFilename, LZ4IO_compressMultipleFilenames */
+#include "mpi.h"
 
 
 /****************************
@@ -560,11 +561,14 @@ int main(int argc, char** argv)
       {
         if (multiple_inputs)
           operationResult = LZ4IO_compressMultipleFilenames(inFileNames, ifnIdx, LZ4_EXTENSION, cLevel);
-        else
-          if (coreCount > 0)
-              LZ4IO_compressFilenameParallel(input_filename, output_filename, cLevel, coreCount);
-          else
-              DEFAULT_COMPRESSOR(input_filename, output_filename, cLevel);
+        else {
+            MPI_Init(&argc, &argv);
+            int rank, noCores;
+            MPI_Comm_size(MPI_COMM_WORLD, &noCores);
+            MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+            LZ4IO_compressFilenameParallel(input_filename, output_filename, cLevel, noCores, rank);
+            MPI_Finalize();
+        }
       }
     }
 
